@@ -34,7 +34,7 @@ use crate::{
 };
 
 /// Representation of a message.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Msg {
     /// The sequence number of the message.
     ///
@@ -234,16 +234,16 @@ impl Msg {
             let date = self
                 .date
                 .as_ref()
-                .map(|date| date.format("%d %b %Y, at %H:%M (%z)").to_string())
-                .unwrap_or_else(|| "unknown date".into());
+                .map(|date| date.format(ReplyStrings::DATE_FORMAT).to_string())
+                .unwrap_or_else(|| ReplyStrings::UNKNOWN_DATE.into());
             let sender = self
                 .reply_to
                 .as_ref()
                 .or_else(|| self.from.as_ref())
                 .and_then(|addrs| addrs.clone().extract_single_info())
                 .map(|addr| addr.display_name.clone().unwrap_or_else(|| addr.addr))
-                .unwrap_or_else(|| "unknown sender".into());
-            let mut content = format!("\n\nOn {}, {} wrote:\n", date, sender);
+                .unwrap_or_else(|| ReplyStrings::UNKNOWN_SENDER.into());
+            let mut content = ReplyStrings::date_wrote(date, sender);
 
             let mut glue = "";
             for line in self.fold_text_parts("plain").trim().lines() {
@@ -263,8 +263,8 @@ impl Msg {
         self.parts = Parts(vec![Part::new_text_plain(plain_content)]);
 
         // Subject
-        if !self.subject.starts_with("Re:") {
-            self.subject = format!("Re: {}", self.subject);
+        if !self.subject.starts_with(ReplyStrings::SUBJECT_PREFIX) {
+            self.subject = format!("{}{}", ReplyStrings::SUBJECT_PREFIX, self.subject);
         }
 
         // From
@@ -844,6 +844,19 @@ impl TryInto<lettre::address::Envelope> for &Msg {
     }
 }
 
+struct ReplyStrings;
+impl ReplyStrings {
+    pub const DATE_FORMAT: &'static str = "%d %b %Y, at %H:%M (%z)";
+    pub const UNKNOWN_DATE: &'static str = "unknown date";
+    pub const UNKNOWN_SENDER: &'static str = "unknown sender";
+
+    pub const SUBJECT_PREFIX: &'static str = "Re: ";
+
+    pub fn date_wrote<T: AsRef<str>>(date: T, sender: T) -> String {
+        format!("\n\nOn {}, {} worte: \n", date.as_ref(), sender.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use mailparse::SingleInfo;
@@ -853,145 +866,184 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_into_reply() {
-        let config = AccountConfig {
-            display_name: "Test".into(),
-            email: "test-account@local".into(),
-            ..AccountConfig::default()
-        };
+    mod into_reply {
+        use himalaya_lib::account::AccountConfig;
+        use mailparse::SingleInfo;
+
+        use crate::msg::{msg_entity::ReplyStrings, Addr, Msg, Part, Parts};
+
+        // Tests a scenario where two Persons A and B are chatting.
+        #[test]
+        fn test_general() {
+            let account_a = AccountConfig {
+                display_name: "Account A".into(),
+                email: "test-email-a@local".into(),
+                ..AccountConfig::default()
+            };
+
+            let account_b = AccountConfig {
+                display_name: "Account B".into(),
+                email: "test-email-b@local".into(),
+                ..AccountConfig::default()
+            };
+
+            // b sends a e-mail to a
+            let msg_for_a = get_message_from_b(&account_b);
+
+            // a replies to that e-mail
+            let a_reply_msg = a_replies_b(&account_a, &account_b, msg_for_a);
+
+            // b replies to the mail of the mail from a
+            let _b_reply_msg = b_replies_a(&account_b, &account_a, a_reply_msg);
+        }
+
+        fn get_message_from_b(account_b: &AccountConfig) -> Msg {
+            // general mail information
+            let msg_id = "msg-id";
+            let subject = "subject";
+
+            Msg {
+                message_id: Some(msg_id.into()),
+                subject: subject.into(),
+                from: Some(
+                    vec![Addr::Single(SingleInfo {
+                        addr: account_b.email.clone().into(),
+                        display_name: account_b.display_name.clone().into(),
+                    })]
+                    .into(),
+                ),
+                ..Msg::default()
+            }
+        }
 
         // Checks that:
         //  - "message_id" moves to "in_reply_to"
         //  - "subject" starts by "Re: "
         //  - "to" is replaced by "from"
         //  - "from" is replaced by the address from the account config
+        fn a_replies_b(account_a: &AccountConfig, account_b: &AccountConfig, msg: Msg) -> Msg {
+            let reply_message = msg.clone().into_reply(false, account_a).unwrap();
 
-        let msg = Msg {
-            message_id: Some("msg-id".into()),
-            subject: "subject".into(),
-            from: Some(
-                vec![Addr::Single(SingleInfo {
-                    addr: "test-sender@local".into(),
-                    display_name: None,
-                })]
-                .into(),
-            ),
-            ..Msg::default()
+            let expected = Msg {
+                message_id: None,
+                in_reply_to: msg.message_id,
+                subject: format!("Re: {}", msg.subject),
+                from: Some(
+                    vec![Addr::Single(SingleInfo {
+                        addr: account_a.email.clone().into(),
+                        display_name: Some(account_a.display_name.clone().into()),
+                    })]
+                    .into(),
+                ),
+                to: Some(
+                    vec![Addr::Single(SingleInfo {
+                        addr: account_b.email.clone().into(),
+                        display_name: Some(account_b.display_name.clone()),
+                    })]
+                    .into(),
+                ),
+                parts: Parts(vec![Part::new_text_plain(
+                        ReplyStrings::date_wrote(ReplyStrings::UNKNOWN_DATE, account_b.display_name)
+                )]),
+                ..Msg::default()
+            };
+
+            assert_eq!(
+                expected, reply_message,
+                "{:#?}, {:#?}",
+                expected, reply_message
+            );
+
+            reply_message
         }
-        .into_reply(false, &config)
-        .unwrap();
-
-        assert_eq!(msg.message_id, None);
-        assert_eq!(msg.in_reply_to.unwrap(), "msg-id");
-        assert_eq!(msg.subject, "Re: subject");
-        assert_eq!(
-            msg.from.unwrap().to_string(),
-            "\"Test\" <test-account@local>"
-        );
-        assert_eq!(msg.to.unwrap().to_string(), "test-sender@local");
 
         // Checks that:
         //  - "subject" does not contains additional "Re: "
         //  - "to" is replaced by reply_to
         //  - "to" contains one address when "all" is false
         //  - "cc" are empty when "all" is false
+        fn b_replies_a(account_b: &AccountConfig, account_a: &AccountConfig, msg: Msg) -> Msg {
+            let reply = msg.clone().into_reply(false, &account_b).unwrap();
 
-        let msg = Msg {
-            subject: "Re: subject".into(),
-            from: Some(
-                vec![Addr::Single(SingleInfo {
-                    addr: "test-sender@local".into(),
-                    display_name: None,
-                })]
-                .into(),
-            ),
-            reply_to: Some(
-                vec![
-                    Addr::Single(SingleInfo {
-                        addr: "test-sender-to-reply@local".into(),
-                        display_name: Some("Sender".into()),
-                    }),
-                    Addr::Single(SingleInfo {
-                        addr: "test-sender-to-reply-2@local".into(),
-                        display_name: Some("Sender 2".into()),
-                    }),
-                ]
-                .into(),
-            ),
-            cc: Some(
-                vec![Addr::Single(SingleInfo {
-                    addr: "test-cc@local".into(),
-                    display_name: None,
-                })]
-                .into(),
-            ),
-            ..Msg::default()
+            let expected = Msg {
+                message_id: None,
+                in_reply_to: msg.message_id,
+                subject: format!("Re: {}", msg.subject),
+                from: Some(
+                    vec![Addr::Single(SingleInfo {
+                        addr: account_b.email.clone().into(),
+                        display_name: Some(account_b.display_name.clone().into()),
+                    })]
+                    .into(),
+                ),
+                to: Some(
+                    vec![Addr::Single(SingleInfo {
+                        addr: account_a.email.clone().into(),
+                        display_name: Some(account_a.display_name.clone()),
+                    })]
+                    .into(),
+                ),
+                parts: Parts(vec![Part::new_text_plain(ReplyStrings::date_wrote(
+                    ReplyStrings::UNKNOWN_DATE,
+                    ReplyStrings::UNKNOWN_SENDER,
+                ))]),
+                ..Msg::default()
+            };
+
+            assert_eq!(expected, reply, "{:#?}, {:#?}", expected, reply);
+
+            reply
         }
-        .into_reply(false, &config)
-        .unwrap();
-
-        assert_eq!(msg.subject, "Re: subject");
-        assert_eq!(
-            msg.to.unwrap().to_string(),
-            "\"Sender\" <test-sender-to-reply@local>"
-        );
-        assert_eq!(msg.cc, None);
 
         // Checks that:
         //  - "to" contains all addresses except for the sender when "all" is true
         //  - "cc" contains all addresses except for the sender when "all" is true
+        #[test]
+        fn test_multiple_sender() {
+            let account_config = AccountConfig {
+                email: "test-account@local".to_string(),
+                display_name: "Test".to_string(),
+                ..AccountConfig::default()
+            };
 
-        let msg = Msg {
-            from: Some(
-                vec![
-                    Addr::Single(SingleInfo {
-                        addr: "test-sender-1@local".into(),
-                        display_name: Some("Sender 1".into()),
-                    }),
-                    Addr::Single(SingleInfo {
-                        addr: "test-sender-2@local".into(),
-                        display_name: Some("Sender 2".into()),
-                    }),
-                    Addr::Single(SingleInfo {
-                        addr: "test-account@local".into(),
-                        display_name: Some("Test".into()),
-                    }),
-                ]
-                .into(),
-            ),
-            cc: Some(
-                vec![
-                    Addr::Single(SingleInfo {
-                        addr: "test-sender-1@local".into(),
-                        display_name: Some("Sender 1".into()),
-                    }),
-                    Addr::Single(SingleInfo {
-                        addr: "test-sender-2@local".into(),
-                        display_name: Some("Sender 2".into()),
-                    }),
-                    Addr::Single(SingleInfo {
-                        addr: "test-account@local".into(),
-                        display_name: None,
-                    }),
-                ]
-                .into(),
-            ),
-            ..Msg::default()
+            let sender1_name = "Sender 1";
+            let sender2_name = "Sender 2";
+
+            let sender1_mail = "test-sender-1@local";
+            let sender2_mail = "test-sender-2@local";
+
+            let senders = vec![
+                Addr::Single(SingleInfo {
+                    addr: sender1_mail.into(),
+                    display_name: Some(sender1_name.into()),
+                }),
+                Addr::Single(SingleInfo {
+                    addr: sender2_mail.into(),
+                    display_name: Some(sender2_name.into()),
+                }),
+                Addr::Single(SingleInfo {
+                    addr: account_config.email.clone(),
+                    display_name: Some(account_config.display_name.clone()),
+                }),
+            ];
+
+            let msg = Msg {
+                from: Some(senders.clone().into()),
+                cc: Some(senders.clone().into()),
+                ..Msg::default()
+            }
+            .into_reply(true, &account_config)
+            .unwrap();
+
+            let expected_line = format!(
+                "\"{}\" <{}>, \"{}\" <{}>",
+                sender1_name, sender1_mail, sender2_name, sender2_mail
+            );
+
+            assert_eq!(msg.to.unwrap().to_string(), expected_line);
+            assert_eq!(msg.cc.unwrap().to_string(), expected_line);
         }
-        .into_reply(true, &config)
-        .unwrap();
-
-        assert_eq!(
-            msg.to.unwrap().to_string(),
-            "\"Sender 1\" <test-sender-1@local>, \"Sender 2\" <test-sender-2@local>"
-        );
-        assert_eq!(
-            msg.cc.unwrap().to_string(),
-            "\"Sender 1\" <test-sender-1@local>, \"Sender 2\" <test-sender-2@local>"
-        );
     }
-
     #[test]
     fn test_to_readable() {
         let config = AccountConfig::default();
